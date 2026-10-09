@@ -59,6 +59,9 @@ OUTPUTS = {
     "windows64": ["build/windows64/halo.exe", "build/windows64/SDL3.dll"],
     # the 64-bit ARM build (ninja windows-arm64), cross-compiled on x64 too
     "windows-arm64": ["build/windows-arm64/halo.exe", "build/windows-arm64/SDL3.dll"],
+    # Windows RT (ninja windows-rt: 32-bit ARM, llvm-mingw, Direct3D 11), with
+    # the probe to run on the device first (tools/rt_probe.c)
+    "windows-rt": ["build/windows-rt/halo.exe", "build/windows-rt/SDL3.dll", "build/windows-rt/rt_probe.exe"],
     "android": [],  # the APK, below
     # the application (universal and self-contained: --portable), whole
     "macos": ["build/macos/ChupathingyCE.app"],
@@ -99,6 +102,9 @@ def main() -> int:
         return alpine_build(args.platform, args.config)
 
     configure = [sys.executable, "configure.py", "--portable"]
+    # (the Windows RT build's llvm-mingw, where CI put it)
+    if os.environ.get("WINDOWS_RT_CC"):
+        configure += ["--windows-rt-cc", os.environ["WINDOWS_RT_CC"]]
     if server:
         # (the profiles are the 32-bit game's, which the servers' clang may
         # not read; a server's work is light)
@@ -155,14 +161,14 @@ def main() -> int:
     if args.platform == "macos":
         # (the SDL3 inside it, the build's own: zlib license)
         shutil.copy2(ROOT / "build/macos/third_party/SDL3/LICENSE.txt", dist / "SDL3-LICENSE.txt")
-    if args.platform in ("windows", "windows64", "windows-arm64"):
+    if args.platform in ("windows", "windows64", "windows-arm64", "windows-rt"):
         # the symbols of halo.exe and SDL3.dll, apart (players do not need
         # them): tools/symbolize_crash.py reads debug.txt's crash lines and
         # the crash reports' calls (port/windows/src/win32_crash.c) with
         # them, and a debugger the reports' minidumps; halo.map, the
         # linker's map, names the functions without LLVM's tools
         symbols = ROOT / "dist" / f"chupathingyce-{args.platform}-{args.config}-symbols"
-        sdl_arch = {"windows64": "x64", "windows-arm64": "arm64"}.get(args.platform, "x86")
+        sdl_arch = {"windows64": "x64", "windows-arm64": "arm64", "windows-rt": "arm"}.get(args.platform, "x86")
         if symbols.exists():
             shutil.rmtree(symbols)
         symbols.mkdir(parents=True)

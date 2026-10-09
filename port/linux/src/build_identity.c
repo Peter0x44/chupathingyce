@@ -53,6 +53,8 @@ HALO_BUILD_FLAVOR.
 #define BUILD_IDENTITY_ARCHITECTURE "x64"
 #elif defined(__i386__) || defined(_M_IX86)
 #define BUILD_IDENTITY_ARCHITECTURE "x86"
+#elif defined(__arm__) || defined(_M_ARM)
+#define BUILD_IDENTITY_ARCHITECTURE "arm"
 #else
 #define BUILD_IDENTITY_ARCHITECTURE "unknown"
 #endif

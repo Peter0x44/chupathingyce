@@ -1,7 +1,7 @@
 name: Build
 
 # Debug and release builds of the native ports (Linux and Windows, 32- and
-# 64-bit, Windows on 64-bit ARM, Android, macOS), and release builds of the
+# 64-bit, Windows on 64-bit ARM, Windows RT on 32-bit ARM, Android, macOS), and release builds of the
 # dedicated server (Linux x86, x64 and arm64) and its container, for every pushed commit and pull
 # request, uploaded as artifacts: whether a change builds. tools/ci_build.py does each build; see it for the options.
 #
@@ -619,6 +619,92 @@ jobs:
         with:
           name: symbols-windows-arm64-release
           path: dist/chupathingyce-windows-arm64-release-symbols
+          retention-days: 3
+
+  windows-rt:
+    # The Windows RT build (ninja windows-rt): 32-bit ARM, built with
+    # llvm-mingw for msvcrt.dll (Windows RT 8.1 has no Universal C Runtime),
+    # its SDL3 built from source (SDL publishes none for 32-bit ARM), drawn
+    # with Direct3D 11 at feature level 9_3. With it, rt_probe.exe, to run on
+    # the device first. (Nothing runs it here: the runner cannot.)
+    runs-on: windows-2025
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      WINDOWS_RT_CC: ${{ github.workspace }}/../llvm-mingw/bin/armv7-w64-mingw32-clang.exe
+    steps:
+      - name: Install the toolchain
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -OutFile ninja.zip https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip
+          Invoke-WebRequest -OutFile ccache.zip https://github.com/ccache/ccache/releases/download/v4.10.2/ccache-4.10.2-windows-x86_64.zip
+          Invoke-WebRequest -OutFile llvm-mingw.zip https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-msvcrt-x86_64.zip
+          # (each download checked against the hash it had when it was pinned)
+          if ((Get-FileHash ninja.zip -Algorithm SHA256).Hash -ne "F550FEC705B6D6FF58F2DB3C374C2277A37691678D6ABA463ADCBB129108467A") { throw "ninja.zip: unexpected SHA-256" }
+          if ((Get-FileHash ccache.zip -Algorithm SHA256).Hash -ne "6252F081876A9A9F700FAE13A5AEC5D0D486B28261D7F1F72AC11C7AD9DF4DA9") { throw "ccache.zip: unexpected SHA-256" }
+          if ((Get-FileHash llvm-mingw.zip -Algorithm SHA256).Hash -ne "1E936A4A694FC27F9625E3311F5EC5D6D99ABFEAA514FD41C52A4F8347145D1A") { throw "llvm-mingw.zip: unexpected SHA-256" }
+          Expand-Archive ninja.zip -DestinationPath "$env:RUNNER_TEMP\tools"
+          Expand-Archive ccache.zip -DestinationPath $env:RUNNER_TEMP
+          Copy-Item "$env:RUNNER_TEMP\ccache-4.10.2-windows-x86_64\ccache.exe" "$env:RUNNER_TEMP\tools"
+          Expand-Archive llvm-mingw.zip -DestinationPath "$env:GITHUB_WORKSPACE\.."
+          Rename-Item "$env:GITHUB_WORKSPACE\..\llvm-mingw-20260922-msvcrt-x86_64" llvm-mingw
+          Remove-Item ninja.zip, ccache.zip, llvm-mingw.zip
+          "$env:RUNNER_TEMP\tools" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-windows-rt-${{ github.sha }}
+          restore-keys: ccache-windows-rt-
+
+      # SDL's development package (its headers) and sources, which
+      # configure.py fetches, and the SDL built from them
+      - uses: actions/cache@v4
+        with:
+          path: |
+            build/windows/third_party
+            build/windows-rt/third_party
+          key: windows-rt-third-party-${{ hashFiles('tools/windows_build.py', 'tools/android_build.py') }}
+
+      - name: Debug
+        run: python tools/ci_build.py windows-rt debug
+
+      - name: Release
+        run: python tools/ci_build.py windows-rt release
+
+      - name: Compile cache
+        run: ccache --show-stats
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chupathingyce-windows-rt-debug
+          path: dist/chupathingyce-windows-rt-debug
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chupathingyce-windows-rt-release
+          path: dist/chupathingyce-windows-rt-release
+          retention-days: 3
+
+      # (halo.exe's symbols and map, which ChupathingyCE's release keeps
+      # privately for the crash reports; not published)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: symbols-windows-rt-debug
+          path: dist/chupathingyce-windows-rt-debug-symbols
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: symbols-windows-rt-release
+          path: dist/chupathingyce-windows-rt-release-symbols
           retention-days: 3
 
   macos:

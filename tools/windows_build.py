@@ -887,5 +887,18 @@ def generate_windows_target(n: Writer, sln: Any, target: WindowsTarget) -> None:
     # internet play's MQTT brokers, a file beside the game (network.brokers_file)
     brokers = build / "brokers.txt"
     n.build(outputs=brokers, rule=f"{prefix}_copy", inputs=Path("port/assets/network/brokers.txt"))
-    n.build(outputs=prefix, rule="phony", inputs=[output, sdl_dll, brokers])
+    extras = []
+    if mingw:
+        # what a Windows RT device offers the game, to run there first
+        # (tools/rt_probe.c)
+        probe = build / "rt_probe.exe"
+        n.rule(
+            name=f"{prefix}_probe",
+            command=f"${prefix}_cc --target={target.triple} -O1 $in -o $out -Wl,--large-address-aware "
+                    "-ld3d11 -ldxgi -ldxguid",
+            description=f"{label} PROBE $out",
+        )
+        n.build(outputs=probe, rule=f"{prefix}_probe", inputs=Path("tools/rt_probe.c"))
+        extras.append(probe)
+    n.build(outputs=prefix, rule="phony", inputs=[output, sdl_dll, brokers, *extras])
     n.newline()

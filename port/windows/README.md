@@ -86,6 +86,38 @@ as CI builds it.
 - Its releases are their own download, `chupathingyce-windows-arm64-release.zip`,
   which its self-updater asks for.
 
+### Windows RT (32-bit ARM)
+
+`ninja windows-rt` builds the 32-bit game for Windows RT 8.1 on 32-bit ARM
+(Surface 2, Surface RT), `build/windows-rt/halo.exe`, with an `SDL3.dll` of
+its own and `rt_probe.exe`:
+
+- It is built with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw)'s
+  msvcrt toolchain (`configure.py --windows-rt-cc` names its
+  `armv7-w64-mingw32-clang`): Windows RT 8.1 has `msvcrt.dll` but no
+  Universal C Runtime. Nothing newer than Windows 8.1's API is called.
+- SDL publishes no 32-bit ARM build, so its pinned sources are built for it
+  (CMake).
+- Windows RT's GPUs have no OpenGL, only Direct3D 11 at feature level 9_3
+  (9_1 on the first Surface RT), so the game draws with the Direct3D 11
+  renderer (`src/d3d8_d3d11.c`, `src/win32_d3d11.c`). Without the GL
+  renderer's anti-aliasing passes, multisampling, per-pixel lighting and
+  point sizes; its overlay (the game list's screens) is not drawn yet.
+  `ninja windows-d3d11` is the same renderer in the 32-bit x86 build, to
+  try it on a computer that runs that; `display.d3d11_feature_level` and
+  `display.d3d11_warp` choose its feature level and software rendering.
+
+On the device:
+
+- Windows RT runs only Microsoft's signed desktop programs: it needs a
+  device whose code integrity checks have been turned off.
+- The 32-bit game needs addresses above 2 GB (the Xbox memory window at
+  0x80000000), which a 32-bit Windows gives a program only with a 3 GB
+  user address space: `bcdedit /set increaseuserva 3072`, then restart.
+- Run `rt_probe.exe` first: it says the GPU's feature level, whether
+  shaders compile there, and whether the address space the game needs can
+  be had.
+
 ## Start the game
 
 Enter `build\windows\halo.exe`.

@@ -161,7 +161,8 @@ static void level_define(GLenum target, GLint level, int format, GLsizei width, 
 		texture->target = target_slot(target) == 2 ? GL_TEXTURE_CUBE_MAP : target_slot(target) == 1 ? GL_TEXTURE_3D :
 			GL_TEXTURE_2D;
 	entry = &texture->levels[face][level];
-	if (level == 0 && (texture->format != format || entry->width != (unsigned int)width ||
+	/* (a cube map's first face starts it; the others follow it) */
+	if (level == 0 && face == 0 && (texture->format != format || entry->width != (unsigned int)width ||
 		entry->height != (unsigned int)height || entry->depth != (unsigned int)depth))
 	{
 		levels_free(texture);

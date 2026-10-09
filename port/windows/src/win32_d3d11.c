@@ -78,6 +78,204 @@ static struct shader_entry *shader_buckets[SHADER_BUCKETS];
 static struct shader_entry **shaders;
 static unsigned int shader_count, shader_capacity;
 
+/* ---------- the shader cache
+
+Compiling a shader takes milliseconds on a desktop and tens of them on
+Windows RT's processors, in the middle of the frame that first draws with
+it. Each compiled shader is kept in shader_cache_d3d11.bin in the save root,
+by its profile and HLSL text (the translators' output is the same from run
+to run), and read back at start-up: a shader compiled before is not
+compiled again. The file is a header, then records appended as they come:
+the profile, the text and the code, each a 32-bit length and its bytes. A
+record cut short (a crash while writing) ends the file. Past
+SHADER_CACHE_MAXIMUM_BYTES, nothing more is added. */
+
+#define SHADER_CACHE_FILE "shader_cache_d3d11.bin"
+#define SHADER_CACHE_HEADER "HD3DSC01"
+#define SHADER_CACHE_MAXIMUM_BYTES (48UL * 1024 * 1024)
+#define SHADER_CACHE_BUCKETS 1024
+
+const char *platform_save_root(void);
+
+typedef HRESULT (WINAPI *create_blob_function)(SIZE_T size, ID3DBlob **blob);
+
+struct cached_shader
+{
+	struct cached_shader *next;
+	unsigned long hash;
+	const char *profile, *text;
+	const void *code;
+	UINT32 code_size;
+};
+
+static struct
+{
+	struct cached_shader *buckets[SHADER_CACHE_BUCKETS];
+	/* the file's contents, which the entries point into */
+	unsigned char *contents;
+	FILE *file;
+	unsigned long size;
+	create_blob_function create_blob;
+} shader_cache;
+
+static unsigned long shader_cache_hash(const char *profile, const char *text)
+{
+	return hash_bytes(text, strlen(text)) ^ (hash_bytes(profile, strlen(profile)) * 2654435761UL);
+}
+
+static void shader_cache_add(const char *profile, const char *text, const void *code, UINT32 code_size)
+{
+	struct cached_shader *entry = calloc(1, sizeof(*entry));
+
+	if (!entry)
+		return;
+	entry->hash = shader_cache_hash(profile, text);
+	entry->profile = profile;
+	entry->text = text;
+	entry->code = code;
+	entry->code_size = code_size;
+	entry->next = shader_cache.buckets[entry->hash % SHADER_CACHE_BUCKETS];
+	shader_cache.buckets[entry->hash % SHADER_CACHE_BUCKETS] = entry;
+}
+
+/* the file's records into the table, and the file open for more */
+static void shader_cache_open(void)
+{
+	char path[1024];
+	FILE *file;
+	long length;
+	unsigned long offset, count = 0;
+
+	shader_cache.create_blob = (create_blob_function)(void *)GetProcAddress(GetModuleHandleW(L"d3dcompiler_47.dll"),
+		"D3DCreateBlob");
+	if (!shader_cache.create_blob || !platform_save_root())
+		return;
+	snprintf(path, sizeof(path), "%s/%s", platform_save_root(), SHADER_CACHE_FILE);
+	if ((file = fopen(path, "rb")) != NULL)
+	{
+		fseek(file, 0, SEEK_END);
+		length = ftell(file);
+		fseek(file, 0, SEEK_SET);
+		shader_cache.contents = length > 8 ? malloc((size_t)length + 1) : NULL;
+		if (shader_cache.contents && fread(shader_cache.contents, 1, (size_t)length, file) != (size_t)length)
+		{
+			free(shader_cache.contents);
+			shader_cache.contents = NULL;
+		}
+		fclose(file);
+		if (shader_cache.contents && !memcmp(shader_cache.contents, SHADER_CACHE_HEADER, 8))
+		{
+			/* each record: the profile and the text, each ending in a NUL
+			(counted in their lengths), and the code */
+			for (offset = 8; offset + 4 <= (unsigned long)length;)
+			{
+				UINT32 sizes[3];
+				const char *strings[2];
+				int part;
+
+				for (part = 0; part < 3; part++)
+				{
+					if (offset + 4 > (unsigned long)length)
+						break;
+					memcpy(&sizes[part], shader_cache.contents + offset, 4);
+					offset += 4;
+					if (sizes[part] > (unsigned long)length - offset)
+						break;
+					if (part < 2)
+					{
+						strings[part] = (const char *)shader_cache.contents + offset;
+						if (!sizes[part] || strings[part][sizes[part] - 1])
+							break;
+					}
+					offset += sizes[part];
+				}
+				if (part < 3)
+					break;
+				shader_cache_add(strings[0], strings[1], shader_cache.contents + offset - sizes[2], sizes[2]);
+				count++;
+			}
+			shader_cache.size = offset;
+			platform_log("Direct3D 11: %lu shaders from %s", count, path);
+		}
+		else if (shader_cache.contents)
+		{
+			free(shader_cache.contents);
+			shader_cache.contents = NULL;
+		}
+	}
+	/* (a file of another layout, or none: started again) */
+	if (!shader_cache.contents)
+	{
+		if ((shader_cache.file = fopen(path, "wb")) != NULL)
+		{
+			fwrite(SHADER_CACHE_HEADER, 1, 8, shader_cache.file);
+			shader_cache.size = 8;
+		}
+	}
+	else
+	{
+		/* (any record cut short is written over) */
+		if ((shader_cache.file = fopen(path, "r+b")) != NULL)
+			fseek(shader_cache.file, (long)shader_cache.size, SEEK_SET);
+	}
+}
+
+/* a shader compiled before, as a blob of its own */
+static ID3DBlob *shader_cache_find(const char *profile, const char *text)
+{
+	unsigned long hash = shader_cache_hash(profile, text);
+	struct cached_shader *entry;
+	ID3DBlob *blob = NULL;
+
+	for (entry = shader_cache.buckets[hash % SHADER_CACHE_BUCKETS]; entry; entry = entry->next)
+	{
+		if (entry->hash == hash && !strcmp(entry->profile, profile) && !strcmp(entry->text, text))
+			break;
+	}
+	if (!entry || FAILED(shader_cache.create_blob(entry->code_size, &blob)))
+		return NULL;
+	memcpy(ID3D10Blob_GetBufferPointer(blob), entry->code, entry->code_size);
+	return blob;
+}
+
+static void shader_cache_store(const char *profile, const char *text, ID3DBlob *code)
+{
+	UINT32 sizes[3];
+	unsigned long record;
+	char *strings;
+	void *copy;
+
+	if (!shader_cache.file)
+		return;
+	sizes[0] = (UINT32)strlen(profile) + 1;
+	sizes[1] = (UINT32)strlen(text) + 1;
+	sizes[2] = (UINT32)ID3D10Blob_GetBufferSize(code);
+	record = 12 + sizes[0] + sizes[1] + sizes[2];
+	if (shader_cache.size + record > SHADER_CACHE_MAXIMUM_BYTES)
+		return;
+	fwrite(&sizes[0], 4, 1, shader_cache.file);
+	fwrite(profile, 1, sizes[0], shader_cache.file);
+	fwrite(&sizes[1], 4, 1, shader_cache.file);
+	fwrite(text, 1, sizes[1], shader_cache.file);
+	fwrite(&sizes[2], 4, 1, shader_cache.file);
+	fwrite(ID3D10Blob_GetBufferPointer(code), 1, sizes[2], shader_cache.file);
+	fflush(shader_cache.file);
+	shader_cache.size += record;
+	/* (and found again this run, as a text and code of its own) */
+	strings = malloc(sizes[0] + sizes[1]);
+	copy = malloc(sizes[2]);
+	if (!strings || !copy)
+	{
+		free(strings);
+		free(copy);
+		return;
+	}
+	memcpy(strings, profile, sizes[0]);
+	memcpy(strings + sizes[0], text, sizes[1]);
+	memcpy(copy, ID3D10Blob_GetBufferPointer(code), sizes[2]);
+	shader_cache_add(strings, strings + sizes[0], copy, sizes[2]);
+}
+
 /* compiled for the device's feature level, optimized, or (where the
 optimizer folds a division by zero, or fails inside) without
 optimization; NULL with the errors logged */
@@ -89,6 +287,8 @@ static ID3DBlob *compile(const char *text, const char *profile, const char *what
 
 	if (!compile_function)
 		return NULL;
+	if (shader_cache.create_blob && (code = shader_cache_find(profile, text)) != NULL)
+		return code;
 	result = compile_function(text, strlen(text), what, NULL, NULL, "main", profile, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
 		&code, &errors);
 	if (FAILED(result))
@@ -110,6 +310,7 @@ static ID3DBlob *compile(const char *text, const char *profile, const char *what
 		return NULL;
 	}
 	RELEASE(errors);
+	shader_cache_store(profile, text, code);
 	return code;
 }
 
@@ -1480,6 +1681,7 @@ int win32_d3d11_initialize(void *window, const char *feature_level, int warp)
 		platform_log("Direct3D 11: cannot load the shader compiler (d3dcompiler_47.dll)");
 		return FALSE;
 	}
+	shader_cache_open();
 
 	vertex_stream.size = VERTEX_BUFFER_SIZE;
 	vertex_stream.buffer = buffer_create(VERTEX_BUFFER_SIZE, D3D11_BIND_VERTEX_BUFFER);

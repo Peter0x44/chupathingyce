@@ -194,6 +194,10 @@ class WindowsTarget:
     # what draws: "gl" (port/linux/src/d3d8_gl.c), or "d3d11", Direct3D 11
     # at feature level 9_3 (HALO_D3D11: port/windows/src/d3d8_d3d11.c)
     renderer: str = "gl"
+    # "msvc": clang for the Microsoft ABI and Visual Studio's C runtime, with
+    # SDL's Visual C++ package; or "mingw": llvm-mingw for msvcrt.dll (the
+    # Windows RT build), with an SDL built here, and GNU ld's options
+    toolchain: str = "msvc"
 
     @property
     def build(self) -> Path:
@@ -202,7 +206,10 @@ class WindowsTarget:
     def march(self, sln: Any) -> str:
         """the instruction set (march_flag): for ARM64 the baseline every
         64-bit ARM processor has with --portable, or when cross-compiling
-        (this machine's processor is not the target's), else this machine's"""
+        (this machine's processor is not the target's), else this machine's;
+        for 32-bit ARM, Windows's own (ARMv7 Thumb-2 with NEON)"""
+        if self.sdl_arch == "arm":
+            return "-march=armv7-a"
         if self.sdl_arch != "arm64":
             return march_flag(sln)
         if getattr(sln, "port_portable", False) or platform.machine().lower() not in ("arm64", "aarch64"):
@@ -322,6 +329,42 @@ WINDOWS_D3D11 = WindowsTarget(
     comment="Native Windows build drawn with Direct3D 11 at feature level 9_3 (ninja windows-d3d11)",
     pgo=False,
     renderer="d3d11",
+)
+
+# The Windows RT build (Windows RT 8.1 on 32-bit ARM: Surface 2, Surface
+# RT): the 32-bit game for ARMv7, built with llvm-mingw against msvcrt.dll
+# (Windows RT 8.1 has no Universal C Runtime), for Windows 8.1's API, drawn
+# with Direct3D 11 at feature level 9_3. Its SDL is built here
+# (sdl_arm_build): SDL publishes none for 32-bit ARM.
+WINDOWS_RT = WindowsTarget(
+    name="windows-rt",
+    triple="armv7-w64-windows-gnu",
+    sdl_arch="arm",
+    abi_flags=[
+        "--target=armv7-w64-windows-gnu",
+        *(flag for flag in WINDOWS_ABI_FLAGS if not flag.startswith("--target=")),
+        *CUSTOM_EDITION_DEFINES,
+        "-DHALO_D3D11",
+        # (msvcrt.dll's printf has no %lld or %zu; mingw's own does)
+        "-D__USE_MINGW_ANSI_STDIO=1",
+        # (as the Xbox's: char is signed on Windows on ARM too)
+        "-fsigned-char",
+    ],
+    game_flags=WINDOWS32.game_flags,
+    platform_flags=WINDOWS32.platform_flags,
+    win32_flags=[*(flag for flag in WIN32_FLAGS if not flag.startswith("-D_WIN32_WINNT=")), "-D_WIN32_WINNT=0x0603"],
+    ldflags=[
+        "--target=armv7-w64-windows-gnu",
+        "-fuse-ld=lld",
+        "-g",
+        # the Xbox memory window is at 0x80000000 (as the 32-bit x86 build)
+        "-Wl,--large-address-aware",
+        "-Wl,--stack,0x800000",
+    ],
+    comment="Windows RT build: 32-bit ARM, llvm-mingw and msvcrt.dll, Direct3D 11 at 9_3 (ninja windows-rt)",
+    pgo=False,
+    renderer="d3d11",
+    toolchain="mingw",
 )
 
 # the platform layer's GL renderer, which the Direct3D 11 builds draw without
@@ -474,13 +517,63 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
     except OSError as error:
         print(f"Windows build disabled: cannot fetch SDL3 ({error})", file=sys.stderr)
         return
-    for target in (WINDOWS32, WINDOWS64, WINDOWS_ARM64, WINDOWS_D3D11):
+    for target in (WINDOWS32, WINDOWS64, WINDOWS_ARM64, WINDOWS_D3D11, WINDOWS_RT):
+        # (the Windows RT build only where its SDL's sources can be had)
+        if target.toolchain == "mingw" and not fetch_sdl_source():
+            print("Windows RT build disabled: cannot clone SDL3's sources", file=sys.stderr)
+            continue
         generate_windows_target(n, sln, target)
+
+
+# the Windows RT build's SDL: the pinned sources (android_build.py's),
+# built for 32-bit ARM by llvm-mingw
+SDL_ARM_SOURCE = THIRD_PARTY / "SDL3-source"
+SDL_ARM_BUILD = Path("build/windows-rt/third_party/SDL3-build")
+
+
+def fetch_sdl_source() -> bool:
+    """SDL3's sources (once), checked against the pinned commit"""
+    from .android_build import SDL_TAG, SDL_URL, check_sdl_commit
+
+    if (SDL_ARM_SOURCE / "CMakeLists.txt").is_file():
+        return True
+    SDL_ARM_SOURCE.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Cloning SDL3 {SDL_TAG} (the Windows RT build's)")
+    if subprocess.run(["git", "clone", "-q", "-c", "advice.detachedHead=false", "--depth", "1", "--branch", SDL_TAG,
+                       SDL_URL, str(SDL_ARM_SOURCE)]).returncode != 0:
+        return False
+    check_sdl_commit(SDL_ARM_SOURCE)
+    return True
+
+
+def sdl_arm_build(n: Writer, prefix: str, cc: str) -> Path:
+    """the rule that builds SDL3.dll for 32-bit ARM with cc's CMake
+    toolchain; returns its import library"""
+    import_library = SDL_ARM_BUILD / "libSDL3.dll.a"
+    # (its C++ compiler and resource compiler beside it: armv7-w64-mingw32-clang++, -windres)
+    suffix = cc[-len(".exe"):] if cc.lower().endswith(".exe") else ""
+    base = cc[: len(cc) - len(suffix)]
+    tool_prefix = base[: -len("clang")] if base.endswith("clang") else "armv7-w64-mingw32-"
+    n.rule(
+        name=f"{prefix}_sdl3",
+        # (through cmd: ninja runs a command without a shell on Windows)
+        command=(f"cmd /c cmake -S {SDL_ARM_SOURCE} -B {SDL_ARM_BUILD} -G Ninja -DCMAKE_BUILD_TYPE=Release "
+                 "-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM "
+                 f"-DCMAKE_C_COMPILER={_quote(cc)} -DCMAKE_CXX_COMPILER={_quote(base + '++' + suffix)} "
+                 f"-DCMAKE_RC_COMPILER={_quote(tool_prefix + 'windres' + suffix)} "
+                 "-DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF "
+                 f"> {SDL_ARM_BUILD.parent / 'sdl3-configure.log'} && ninja -C {SDL_ARM_BUILD} "
+                 f"> {SDL_ARM_BUILD.parent / 'sdl3-build.log'}"),
+        description=f"{prefix.upper()} SDL3 (32-bit ARM)",
+    )
+    n.build(outputs=[import_library, SDL_ARM_BUILD / "SDL3.dll"], rule=f"{prefix}_sdl3",
+            implicit=[SDL_ARM_SOURCE / "CMakeLists.txt"])
+    return import_library
 
 
 def generate_windows_target(n: Writer, sln: Any, target: WindowsTarget) -> None:
     """one Windows build's rules: ``ninja windows``, ``ninja windows64``,
-    ``ninja windows-arm64`` or ``ninja windows-d3d11``"""
+    ``ninja windows-arm64``, ``ninja windows-d3d11`` or ``ninja windows-rt``"""
     linux_config: Dict[str, Any] = json.loads((LINUX_DIR / "port.json").read_text(encoding="utf-8"))
     config = _load_config()
 
@@ -492,7 +585,9 @@ def generate_windows_target(n: Writer, sln: Any, target: WindowsTarget) -> None:
     output = build / "halo.exe"
     sdl_dll = build / "SDL3.dll"
     sdl_lib = SDL_DIR / "lib" / target.sdl_arch
-    cc = getattr(sln, "windows_cc", None) or "clang"
+    mingw = target.toolchain == "mingw"
+    cc = (getattr(sln, "windows_rt_cc", None) or "armv7-w64-mingw32-clang") if mingw else \
+        (getattr(sln, "windows_cc", None) or "clang")
     prefix_header = PORT_DIR / "include" / "halo_windows_prefix.h"
     crt_include = PORT_DIR / "include" / "crt"
     posix_include = PORT_DIR / "include" / "posix"
@@ -504,13 +599,24 @@ def generate_windows_target(n: Writer, sln: Any, target: WindowsTarget) -> None:
     # does not (the Linux build's generator also writes these declarations)
     n.rule(
         name=f"{prefix}_msvc_tags",
-        command="$python tools/linux_msvc_semantics.py --output $out --tags source",
+        command="$python tools/linux_msvc_semantics.py --output $out $scan",
         description=f"{label} MSVC TAGS $out",
         restat=True,
     )
     game_headers = sorted(p for p in Path("source").rglob("*") if p.suffix in (".c", ".h"))
+    # (mingw's GNU target has no COMDAT C inlines either: as the Linux
+    # build, the header also makes each inline function weak, and the
+    # platform layer has one of its own for the SDK's inlines,
+    # halo_windows_prefix.h)
     n.build(outputs=tags_header, rule=f"{prefix}_msvc_tags",
-            implicit=[Path("tools/linux_msvc_semantics.py"), *game_headers])
+            implicit=[Path("tools/linux_msvc_semantics.py"), *game_headers, *(xdk_headers() if mingw else [])],
+            variables={"scan": f"--all-inlines --tags source --inlines source --inlines {XDK_INCLUDE}" if mingw
+                       else "--tags source"})
+    platform_semantics_header = build / "platform_msvc_semantics.h"
+    if mingw:
+        n.build(outputs=platform_semantics_header, rule=f"{prefix}_msvc_tags",
+                implicit=[Path("tools/linux_msvc_semantics.py"), *xdk_headers()],
+                variables={"scan": f"--inlines {XDK_INCLUDE}"})
     n.rule(
         name=f"{prefix}_cc",
         command=f"{compile_launcher(sln)}${prefix}_cc -MMD -MF $out.d $cflags -c $in -o $out",
@@ -544,15 +650,29 @@ def generate_windows_target(n: Writer, sln: Any, target: WindowsTarget) -> None:
                                                            else ["-fstack-protector-strong"])
                    + game_browser_defines(sln))
     sdl_include = SDL_DIR / "include"
+    sdl_import = sdl_arm_build(n, prefix, cc) if mingw else sdl_lib / "SDL3.lib"
+    if mingw:
+        sdl_lib = sdl_import.parent
     libs = " ".join(
-        [_quote(sdl_lib / "SDL3.lib")]
+        [_quote(sdl_import)]
         + [f"-l{lib}" for lib in config.get("libraries", [])]
         + ([f"-l{lib}" for lib in D3D11_LIBRARIES] if target.renderer == "d3d11" else [])
     )
     # (the linker's map beside the program, halo.map: its functions'
     # addresses, kept with the symbols, tools/ci_build.py)
-    base_ldflags = list(target.ldflags) + ["-Wl,/MAP"]
-    if getattr(sln, "port_release", False):
+    if mingw:
+        # (GNU ld's spellings of the same, and the symbols' PDB beside it)
+        base_ldflags = list(target.ldflags) + [f"-Wl,-Map={_quote(build / 'halo.map')}",
+                                               f"-Wl,--pdb={_quote(build / 'halo.pdb')}"]
+        if getattr(sln, "port_release", False):
+            base_ldflags += ["-Wl,--subsystem,windows", "-Wl,-e,mainCRTStartup"]
+        else:
+            base_ldflags += ["-Wl,--subsystem,console"]
+    else:
+        base_ldflags = list(target.ldflags) + ["-Wl,/MAP"]
+    if mingw:
+        pass
+    elif getattr(sln, "port_release", False):
         # no console window (the port's log goes to halo.log instead,
         # win32_posix.c): under Wine (Proton, gamescope) the console window
         # can hide the game's window
@@ -572,12 +692,15 @@ def generate_windows_target(n: Writer, sln: Any, target: WindowsTarget) -> None:
             compiled = inline_export_wrapper(source, build)
             if target.sdl_arch == "arm64" and source.parent == MINIUPNPC_DIR / "src":
                 compiled = miniupnpc_arm64_wrapper(source, build)
+            # (each unit's own first symbol: halo_windows_prefix.h HALO_UNIT)
+            unit = " -DHALO_UNIT=halo_unit_" + re.sub(r"\W", "_", source.as_posix()) if mingw else ""
             n.build(
                 outputs=obj,
                 rule=f"{prefix}_cc",
                 inputs=compiled,
-                implicit=[*xdk_headers(), prefix_header, tags_header, source, *implicit_inputs],
-                variables={"cflags": f"{cflags} {extra}"},
+                implicit=[*xdk_headers(), prefix_header, tags_header, source, *implicit_inputs,
+                          *([platform_semantics_header] if mingw else [])],
+                variables={"cflags": f"{cflags} {extra}{unit}"},
             )
 
         game_cflags = " ".join([
@@ -614,6 +737,7 @@ def generate_windows_target(n: Writer, sln: Any, target: WindowsTarget) -> None:
             abi,
             " ".join(target.platform_flags),
             f"-include {prefix_header}",
+            *([f"-include {platform_semantics_header}"] if mingw else []),
             f"-I{posix_include}",
             f"-I{crt_include}",
             f"-I{linux_platform}",
@@ -701,6 +825,8 @@ def generate_windows_target(n: Writer, sln: Any, target: WindowsTarget) -> None:
             outputs=output,
             rule=f"{prefix}_link",
             inputs=objects + extra_objects,
+            # (an SDL built here: before the link that names it)
+            implicit=[sdl_import] if mingw else [],
             variables={"ldflags": " ".join(base_ldflags + extra_ldflags), "libs": libs},
         )
 

@@ -660,6 +660,12 @@ static void crash_write_report(HANDLE process, DWORD thread_id, ULONG_PTR except
 	frame.AddrPC.Offset = context.Rip;
 	frame.AddrFrame.Offset = context.Rbp;
 	frame.AddrStack.Offset = context.Rsp;
+#elif defined(__arm__)
+	/* (32-bit ARM: the Windows RT build; Windows's frame pointer is r11) */
+	machine = IMAGE_FILE_MACHINE_ARMNT;
+	frame.AddrPC.Offset = context.Pc;
+	frame.AddrFrame.Offset = context.R11;
+	frame.AddrStack.Offset = context.Sp;
 #else
 	machine = IMAGE_FILE_MACHINE_I386;
 	frame.AddrPC.Offset = context.Eip;
@@ -960,20 +966,33 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *exception)
 			crash_line("crash: called from %p", frames[depth]);
 	}
 #else
+#ifdef __arm__
+	/* (32-bit ARM: Windows keeps r11 as the frame pointer, the frame record
+	the caller's r11 then the return address, as x86's ebp chain) */
+	const DWORD *stack = (const DWORD *)context->Sp;
+
+	crash_line("crash: exception %08lx at %p (accessing %p), pc %08lx r11 %08lx sp %08lx lr %08lx",
+		record->ExceptionCode, record->ExceptionAddress,
+		record->NumberParameters >= 2 ? (void *)record->ExceptionInformation[1] : NULL,
+		context->Pc, context->R11, context->Sp, context->Lr);
+#define CRASH_FRAME_POINTER R11
+#else
 	const DWORD *stack = (const DWORD *)context->Esp;
 
 	crash_line("crash: exception %08lx at %p (accessing %p), eip %08lx ebp %08lx esp %08lx",
 		record->ExceptionCode, record->ExceptionAddress,
 		record->NumberParameters >= 2 ? (void *)record->ExceptionInformation[1] : NULL,
 		context->Eip, context->Ebp, context->Esp);
+#define CRASH_FRAME_POINTER Ebp
+#endif
 	if (!IsBadReadPtr(stack, 6 * sizeof(DWORD)))
 	{
 		crash_line("crash: stack %08lx %08lx %08lx %08lx %08lx %08lx",
 			stack[0], stack[1], stack[2], stack[3], stack[4], stack[5]);
 	}
 	{
-		/* the EBP frame chain (the game keeps frame pointers) */
-		const DWORD *frame = (const DWORD *)context->Ebp;
+		/* the frame chain (the game keeps frame pointers) */
+		const DWORD *frame = (const DWORD *)context->CRASH_FRAME_POINTER;
 		int depth;
 
 		for (depth = 0; depth < 32 && frame && !IsBadReadPtr(frame, 2 * sizeof(DWORD)); depth++)

@@ -8,7 +8,15 @@ Windows <time.h> plus the POSIX clocks and nanosleep
 #ifndef __HALO_WINDOWS_TIME_H
 #define __HALO_WINDOWS_TIME_H
 
+/* (mingw's <time.h> would bring winpthreads' clocks, inline: the port has
+its own) */
+#if defined(__MINGW32__) && !defined(IN_WINPTHREAD)
+#define IN_WINPTHREAD 1
 #include_next <time.h>
+#undef IN_WINPTHREAD
+#else
+#include_next <time.h>
+#endif
 
 typedef int clockid_t;
 

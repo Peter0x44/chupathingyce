@@ -15,6 +15,7 @@ port/linux/src/msvc_crt.c).
 #include <stdarg.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <wchar.h>
 
 static const char *translated(const char *path, char *buffer, size_t size)
 {
@@ -95,3 +96,27 @@ int halo_windows_rmdir(const char *path)
 
 	return _rmdir(translated(path, host_path, sizeof(host_path)));
 }
+
+#ifdef __MINGW32__
+/* MSVC's compiler barrier, which the game declares and calls
+(scenario/scenario.c); llvm-mingw has it only as a macro of <intrin.h>,
+which halo_windows_prefix.h takes away. A call is itself a barrier. */
+void _ReadWriteBarrier(void)
+{
+	__asm__ __volatile__("" ::: "memory");
+}
+
+/* _getws (text/unicode.c's ugets), which msvcrt.dll's import library for
+32-bit ARM has not: a line of the console's input, without its newline */
+wchar_t *_getws(wchar_t *buffer)
+{
+	size_t length;
+
+	if (!fgetws(buffer, 1024, stdin))
+		return NULL;
+	length = wcslen(buffer);
+	if (length && buffer[length - 1] == L'\n')
+		buffer[length - 1] = 0;
+	return buffer;
+}
+#endif

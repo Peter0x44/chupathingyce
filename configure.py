@@ -28,6 +28,12 @@ parser.add_argument(
     "server, `ninja server` (default: clang)",
 )
 parser.add_argument(
+    "--windows-rt-cc",
+    metavar="BINARY",
+    help="compiler for the Windows RT build, `ninja windows-rt`: llvm-mingw's for 32-bit ARM and msvcrt.dll "
+    "(default: armv7-w64-mingw32-clang)",
+)
+parser.add_argument(
     "--compiler-launcher",
     metavar="BINARY",
     help="a program that runs each compile, such as ccache "
@@ -91,6 +97,7 @@ args = parser.parse_args()
 sln = SimpleNamespace(
     build_dir=Path("build"),
     linux_cc=args.linux_cc,
+    windows_rt_cc=args.windows_rt_cc,
     compiler_launcher=args.compiler_launcher,
     port_release=args.release,
     game_browser=args.game_browser,

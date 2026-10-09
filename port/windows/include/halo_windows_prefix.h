@@ -11,11 +11,61 @@ much shorter than the Linux build's halo_linux_prefix.h.
 #ifndef __HALO_WINDOWS_PREFIX_H
 #define __HALO_WINDOWS_PREFIX_H
 
-#if !defined(_M_IX86) && !((defined(_M_X64) || defined(_M_ARM64)) && defined(HALO_64BIT))
-#error the Windows port targets 32-bit x86, or x64 or ARM64 with HALO_64BIT: game data structures assume 32-bit pointers
+/* (32-bit ARM: the Windows RT build, whose llvm-mingw has __arm__ rather
+than _M_ARM) */
+#if !(defined(_M_IX86) || defined(__arm__)) && !((defined(_M_X64) || defined(_M_ARM64)) && defined(HALO_64BIT))
+#error the Windows port targets 32-bit x86 or ARM, or x64 or ARM64 with HALO_64BIT: game data structures assume 32-bit pointers
 #endif
 
 #define HALO_WINDOWS 1
+
+/* ---------- llvm-mingw (the Windows RT build)
+
+mingw's target is a GNU one: its C inlines are not MSVC's COMDATs, and its
+headers spell __forceinline as an extern GNU inline. As the Linux build
+does (halo_linux_prefix.h): the C runtime's headers first, before the
+redefinitions below can reach them (their include guards keep later
+includes from seeing them), then every inline function static, and those
+that also have an ordinary prototype weak (the generated
+halo_msvc_tags.h's #pragma weak). <limits.h> is left out: cseries.h
+defines LONG_MAX and friends as enumerators; <stdlib.h> too (libtiff
+declares its malloc itself, and stdlib's own inlines are static). */
+
+#ifdef __MINGW32__
+#include <_mingw.h>
+#include <stddef.h>
+#include <stdarg.h>
+#include <float.h>
+#include <ctype.h>
+#include <errno.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <time.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <wchar.h>
+#include <assert.h>
+/* (SDL's headers include it: ahead of the _Interlocked* names below) */
+#include <intrin.h>
+/* (a macro of intrin.h's; the game declares it a function, which
+windows_crt.c defines) */
+#undef _ReadWriteBarrier
+#undef __forceinline
+#define __inline static __inline__
+#define _inline static __inline__
+#define __forceinline static __inline__ __attribute__((always_inline))
+/* A COFF weak definition's default is named after the unit's first public
+symbol, which two units can share (an Xbox SDK table, an auto-import
+reference), and the link then refuses the two defaults: each unit's first
+symbol is its own, named after it (HALO_UNIT, tools/windows_build.py). */
+#ifdef HALO_UNIT
+void HALO_UNIT(void);
+void HALO_UNIT(void)
+{
+}
+#endif
+#endif
 
 /* ---------- pointers inside Xbox data (the 64-bit builds': ninja windows64;
 no-ops in the 32-bit build, as in the Linux build: the shared sources name
@@ -38,7 +88,10 @@ wchar_t *__cdecl _getws(wchar_t *buffer);
 
 /* ---------- XDK architecture selection */
 
+/* (not for 32-bit ARM, whose mingw headers would take it for x86) */
+#ifndef __arm__
 #define _X86_ 1
+#endif
 #define _STDCALL_SUPPORTED 1
 #define _USE_MATH_DEFINES
 

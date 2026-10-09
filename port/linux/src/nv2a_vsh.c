@@ -386,6 +386,190 @@ static const char shader_prologue[] =
 	"	return vec4(1.0, max(s.x, 0.0), specular, 1.0);\n"
 	"}\n";
 
+/* the program's registers, declared with the given type name for a 4-vector
+(vec4, float4) and the temporaries' first value (0.0; HLSL's is the constant
+buffer's zero, which the compiler cannot fold into a division by zero, an
+infinity that shader model 4 refuses to compile) */
+static void program_registers(struct xgpu_text *text, const char *vec4, const char *zero)
+{
+	const char *z = zero;
+
+	xgpu_text_append(text,
+		"\t%s r0 = vec4(%s), r1 = vec4(%s), r2 = vec4(%s), r3 = vec4(%s);\n"
+		"\t%s r4 = vec4(%s), r5 = vec4(%s), r6 = vec4(%s), r7 = vec4(%s);\n"
+		"\t%s r8 = vec4(%s), r9 = vec4(%s), r10 = vec4(%s), r11 = vec4(%s);\n",
+		vec4, z, z, z, z, vec4, z, z, z, z, vec4, z, z, z, z);
+	/* (the outputs, which the program can read back: the position as r12) */
+	xgpu_text_append(text,
+		"\t%s oPos = vec4(%s, %s, %s, 1.0);\n"
+		"\t%s oD0 = vec4(%s, %s, %s, 1.0), oD1 = vec4(%s, %s, %s, 1.0);\n"
+		"\t%s oB0 = vec4(%s, %s, %s, 1.0), oB1 = vec4(%s, %s, %s, 1.0);\n"
+		"\t%s oT0 = vec4(%s, %s, %s, 1.0), oT1 = vec4(%s, %s, %s, 1.0);\n"
+		"\t%s oT2 = vec4(%s, %s, %s, 1.0), oT3 = vec4(%s, %s, %s, 1.0);\n",
+		vec4, z, z, z, vec4, z, z, z, z, z, z, vec4, z, z, z, z, z, z, vec4, z, z, z, z, z, z,
+		vec4, z, z, z, z, z, z);
+	xgpu_text_append(text,
+		"\t%s oFog = vec4(1.0), oPts = vec4(point_size), oUnused = vec4(%s);\n"
+		"\tint a0 = 0;\n"
+		"\t%s A, B, C, mac, ilu;\n",
+		vec4, z, vec4);
+	xgpu_text_append(text, "\t%s clip_position = vec4(%s);\n\tbool clip_captured = false;\n", vec4, z);
+}
+
+/* the program's instructions, the same in GLSL and in HLSL (whose prelude
+gives GLSL's names: XGPU_HLSL_PRELUDE) */
+static void program_instructions(struct xgpu_text *text, const DWORD *instructions, unsigned long instruction_count,
+	const struct nv2a_vertex_lighting *lighting)
+{
+	unsigned long index;
+
+	for (index = 0; index < instruction_count; index++)
+	{
+		const DWORD *instruction = instructions + index * 4;
+		unsigned long mac = field(instruction, 1, 21, 4);
+		unsigned long ilu = field(instruction, 1, 25, 3);
+		unsigned long mac_mask = field(instruction, 3, 24, 4);
+		unsigned long temporary = field(instruction, 3, 20, 4);
+		unsigned long ilu_mask = field(instruction, 3, 16, 4);
+		unsigned long output_mask = field(instruction, 3, 12, 4);
+		unsigned long output_is_register = field(instruction, 3, 11, 1);
+		unsigned long output_address = field(instruction, 3, 3, 8);
+		unsigned long output_from_ilu = field(instruction, 3, 2, 1);
+		int relative = (int)field(instruction, 3, 1, 1);
+		char mask[5];
+
+		xgpu_text_append(text, "\t/* %lu */\n", index);
+		/* the lighting's normal and position, before the program reuses them */
+		if (lighting && index == lighting->normal_instruction)
+		{
+			xgpu_text_append(text, "\txWorldNormal = vec4(r%lu.xyz, length(r%lu.xyz));\n",
+				lighting->normal_register, lighting->normal_register);
+		}
+		if (lighting && lighting->lights == 2 && index == lighting->position_instruction)
+			xgpu_text_append(text, "\txWorldPosition = r%lu.xyz;\n", lighting->position_register);
+		xgpu_text_append(text, "\tA = "); operand(text, instruction, 'A', relative); xgpu_text_append(text, ";\n");
+		xgpu_text_append(text, "\tB = "); operand(text, instruction, 'B', relative); xgpu_text_append(text, ";\n");
+		xgpu_text_append(text, "\tC = "); operand(text, instruction, 'C', relative); xgpu_text_append(text, ";\n");
+
+		switch (mac)
+		{
+		case _mac_nop: break;
+		case _mac_mov: xgpu_text_append(text, "\tmac = A;\n"); break;
+		case _mac_mul: xgpu_text_append(text, "\tmac = A * B;\n"); break;
+		case _mac_add: xgpu_text_append(text, "\tmac = A + C;\n"); break;
+		case _mac_mad: xgpu_text_append(text, "\tmac = A * B + C;\n"); break;
+		case _mac_dp3: xgpu_text_append(text, "\tmac = vec4(dot(A.xyz, B.xyz));\n"); break;
+		case _mac_dph: xgpu_text_append(text, "\tmac = vec4(dot(A.xyz, B.xyz) + B.w);\n"); break;
+		case _mac_dp4: xgpu_text_append(text, "\tmac = vec4(dot(A, B));\n"); break;
+		case _mac_dst: xgpu_text_append(text, "\tmac = vec4(1.0, A.y * B.y, A.z, B.w);\n"); break;
+		case _mac_min: xgpu_text_append(text, "\tmac = min(A, B);\n"); break;
+		case _mac_max: xgpu_text_append(text, "\tmac = max(A, B);\n"); break;
+		case _mac_slt: xgpu_text_append(text, "\tmac = vec4(lessThan(A, B));\n"); break;
+		case _mac_sge: xgpu_text_append(text, "\tmac = vec4(greaterThanEqual(A, B));\n"); break;
+		case _mac_arl: xgpu_text_append(text, "\tmac = A;\n"); break;
+		default: xgpu_text_append(text, "\tmac = vec4(0.0);\n"); break;
+		}
+		switch (ilu)
+		{
+		case _ilu_nop: break;
+		case _ilu_mov: xgpu_text_append(text, "\tilu = C;\n"); break;
+		case _ilu_rcp: xgpu_text_append(text, "\tilu = vec4(1.0 / C.x);\n"); break;
+		case _ilu_rcc: xgpu_text_append(text, "\tilu = nv2a_rcc(C.x);\n"); break;
+		case _ilu_rsq: xgpu_text_append(text, "\tilu = vec4(inversesqrt(abs(C.x)));\n"); break;
+		case _ilu_exp: xgpu_text_append(text, "\tilu = nv2a_exp(C.x);\n"); break;
+		case _ilu_log: xgpu_text_append(text, "\tilu = nv2a_log(C.x);\n"); break;
+		case _ilu_lit: xgpu_text_append(text, "\tilu = nv2a_lit(C);\n"); break;
+		default: xgpu_text_append(text, "\tilu = vec4(0.0);\n"); break;
+		}
+		/* the screen-space conversion takes the reciprocal of the clip-space
+		position's w (rcc of r12.w); keep the position it converts */
+		if (ilu == _ilu_rcc && field(instruction, 3, 28, 2) == _mux_temporary &&
+			((field(instruction, 2, 0, 2) << 2) | field(instruction, 3, 30, 2)) == 12)
+		{
+			xgpu_text_append(text, "\tclip_position = oPos;\n\tclip_captured = true;\n");
+		}
+
+		/* results are written only after both units have read their inputs */
+		if (mac == _mac_arl)
+		{
+			xgpu_text_append(text, "\ta0 = int(floor(mac.x + 0.001));\n");
+		}
+		else if (mac != _mac_nop && mac_mask)
+		{
+			write_mask(mac_mask, mask);
+			if (temporary == 12)
+				xgpu_text_append(text, "\toPos.%s = mac.%s;\n", mask, mask);
+			else
+				xgpu_text_append(text, "\tr%lu.%s = mac.%s;\n", temporary, mask, mask);
+		}
+		if (ilu != _ilu_nop && ilu_mask)
+		{
+			unsigned long ilu_temporary = mac != _mac_nop ? 1 : temporary;
+
+			write_mask(ilu_mask, mask);
+			if (ilu_temporary == 12)
+				xgpu_text_append(text, "\toPos.%s = ilu.%s;\n", mask, mask);
+			else
+				xgpu_text_append(text, "\tr%lu.%s = ilu.%s;\n", ilu_temporary, mask, mask);
+		}
+		if (output_mask && (output_from_ilu ? ilu : mac) != 0)
+		{
+			const char *source = output_from_ilu ? "ilu" : "mac";
+
+			write_mask(output_mask, mask);
+			if (output_is_register)
+				xgpu_text_append(text, "\t%s.%s = %s.%s;\n", output_name(output_address), mask, source, mask);
+			/* writes to constant memory are not used by Halo's shaders */
+		}
+		if (field(instruction, 3, 0, 1))
+			break;
+	}
+}
+
+/* position, the clip-space position the program's screen-space one came
+from, declared with the given type names for a 3- and a 4-vector */
+static void program_position(struct xgpu_text *text, const char *vec3, const char *vec4)
+{
+	xgpu_text_append(text,
+		"\t/* undo the screen-space conversion done with c[-38] and c[-37] */\n"
+		"\t%s scale = vec3(viewport_scale.x != 0.0 ? viewport_scale.x : 1.0,\n"
+		"\t\tviewport_scale.y != 0.0 ? viewport_scale.y : 1.0,\n"
+		"\t\tviewport_scale.z != 0.0 ? viewport_scale.z : 1.0);\n"
+		/* Direct3D 8 puts pixel centres on integer screen coordinates (the
+		game offsets its screen-space quads by -0.5 to match), OpenGL on
+		half-integers */
+		/* The conversion is screen = clip * c[-38] * rcc(w) + c[-37]; undoing
+		it by multiplying by w again is lossy near the camera plane, where
+		rcc clamps and 1/w rounds differently on each GPU (Mali put vertices
+		of the first-person weapon at the vanishing point, and desktop GPUs
+		threw the first-person arms' and weapon's vertices there in a pose
+		that brought them close to the camera: spikes from the screen's edge
+		to its center). Where the clip position was kept, the same result is
+		computed without dividing. */
+		"\t%s position;\n"
+		"\tif (clip_captured)\n"
+		"\t\tposition = vec4((clip_position.xyz * c[%d].xyz + (c[%d].xyz + vec3(0.5 + screen_offset, 0.5, 0.0)\n"
+		"\t\t\t- viewport_offset.xyz) * clip_position.w) / scale, clip_position.w);\n"
+		"\telse\n"
+		"\t{\n"
+		"\t\t%s ndc = (vec3(oPos.xy + vec2(0.5 + screen_offset, 0.5), oPos.z) - viewport_offset.xyz) / scale;\n"
+		"\t\tposition = vec4(ndc * oPos.w, oPos.w);\n"
+		"\t}\n"
+		/* A position whose w is zero, or is not a number, is the clip-space
+		origin: the screen conversion's reciprocal is clamped rather than
+		infinite, so a large position times a w of zero is exactly zero, and
+		the origin is inside the frustum. Nothing then clips the triangle
+		away and OpenGL divides zero by zero there: the vertex lands on the
+		middle of the screen and the triangle is drawn out to it from the
+		first-person weapon, whose pose follows the camera and so reaches the
+		camera plane. The divide on the Xbox sends such a vertex to infinity
+		and the clipper takes the triangle; put it behind the camera instead,
+		which the clipper also takes. */
+		"\tif (!(abs(position.w) > 0.0))\n"
+		"\t\tposition = vec4(0.0, 0.0, 0.0, -1.0);\n",
+		vec3, vec4, XGPU_VERTEX_CONSTANT_BIAS - 38, XGPU_VERTEX_CONSTANT_BIAS - 37, vec3);
+}
+
 char *nv2a_vertex_shader_to_glsl(const DWORD *instructions, unsigned long instruction_count,
 	unsigned long packed_attribute_mask, const struct nv2a_vertex_lighting *lighting)
 {
@@ -417,159 +601,10 @@ char *nv2a_vertex_shader_to_glsl(const DWORD *instructions, unsigned long instru
 		else
 			xgpu_text_append(&text, "\tvec4 v%lu = v%lu_in;\n", index, index);
 	}
+	program_registers(&text, "vec4", "0.0");
+	program_instructions(&text, instructions, instruction_count, lighting);
+	program_position(&text, "vec3", "vec4");
 	xgpu_text_append(&text,
-		"\tvec4 r0 = vec4(0.0), r1 = vec4(0.0), r2 = vec4(0.0), r3 = vec4(0.0);\n"
-		"\tvec4 r4 = vec4(0.0), r5 = vec4(0.0), r6 = vec4(0.0), r7 = vec4(0.0);\n"
-		"\tvec4 r8 = vec4(0.0), r9 = vec4(0.0), r10 = vec4(0.0), r11 = vec4(0.0);\n"
-		"\tvec4 oPos = vec4(0.0, 0.0, 0.0, 1.0);\n"
-		"\tvec4 oD0 = vec4(0.0, 0.0, 0.0, 1.0), oD1 = vec4(0.0, 0.0, 0.0, 1.0);\n"
-		"\tvec4 oB0 = vec4(0.0, 0.0, 0.0, 1.0), oB1 = vec4(0.0, 0.0, 0.0, 1.0);\n"
-		"\tvec4 oT0 = vec4(0.0, 0.0, 0.0, 1.0), oT1 = vec4(0.0, 0.0, 0.0, 1.0);\n"
-		"\tvec4 oT2 = vec4(0.0, 0.0, 0.0, 1.0), oT3 = vec4(0.0, 0.0, 0.0, 1.0);\n"
-		"\tvec4 oFog = vec4(1.0), oPts = vec4(point_size), oUnused = vec4(0.0);\n"
-		"\tint a0 = 0;\n"
-		"\tvec4 A, B, C, mac, ilu;\n");
-	xgpu_text_append(&text, "\tvec4 clip_position = vec4(0.0);\n\tbool clip_captured = false;\n");
-
-	for (index = 0; index < instruction_count; index++)
-	{
-		const DWORD *instruction = instructions + index * 4;
-		unsigned long mac = field(instruction, 1, 21, 4);
-		unsigned long ilu = field(instruction, 1, 25, 3);
-		unsigned long mac_mask = field(instruction, 3, 24, 4);
-		unsigned long temporary = field(instruction, 3, 20, 4);
-		unsigned long ilu_mask = field(instruction, 3, 16, 4);
-		unsigned long output_mask = field(instruction, 3, 12, 4);
-		unsigned long output_is_register = field(instruction, 3, 11, 1);
-		unsigned long output_address = field(instruction, 3, 3, 8);
-		unsigned long output_from_ilu = field(instruction, 3, 2, 1);
-		int relative = (int)field(instruction, 3, 1, 1);
-		char mask[5];
-
-		xgpu_text_append(&text, "\t/* %lu */\n", index);
-		/* the lighting's normal and position, before the program reuses them */
-		if (lighting && index == lighting->normal_instruction)
-		{
-			xgpu_text_append(&text, "\txWorldNormal = vec4(r%lu.xyz, length(r%lu.xyz));\n",
-				lighting->normal_register, lighting->normal_register);
-		}
-		if (lighting && lighting->lights == 2 && index == lighting->position_instruction)
-			xgpu_text_append(&text, "\txWorldPosition = r%lu.xyz;\n", lighting->position_register);
-		xgpu_text_append(&text, "\tA = "); operand(&text, instruction, 'A', relative); xgpu_text_append(&text, ";\n");
-		xgpu_text_append(&text, "\tB = "); operand(&text, instruction, 'B', relative); xgpu_text_append(&text, ";\n");
-		xgpu_text_append(&text, "\tC = "); operand(&text, instruction, 'C', relative); xgpu_text_append(&text, ";\n");
-
-		switch (mac)
-		{
-		case _mac_nop: break;
-		case _mac_mov: xgpu_text_append(&text, "\tmac = A;\n"); break;
-		case _mac_mul: xgpu_text_append(&text, "\tmac = A * B;\n"); break;
-		case _mac_add: xgpu_text_append(&text, "\tmac = A + C;\n"); break;
-		case _mac_mad: xgpu_text_append(&text, "\tmac = A * B + C;\n"); break;
-		case _mac_dp3: xgpu_text_append(&text, "\tmac = vec4(dot(A.xyz, B.xyz));\n"); break;
-		case _mac_dph: xgpu_text_append(&text, "\tmac = vec4(dot(A.xyz, B.xyz) + B.w);\n"); break;
-		case _mac_dp4: xgpu_text_append(&text, "\tmac = vec4(dot(A, B));\n"); break;
-		case _mac_dst: xgpu_text_append(&text, "\tmac = vec4(1.0, A.y * B.y, A.z, B.w);\n"); break;
-		case _mac_min: xgpu_text_append(&text, "\tmac = min(A, B);\n"); break;
-		case _mac_max: xgpu_text_append(&text, "\tmac = max(A, B);\n"); break;
-		case _mac_slt: xgpu_text_append(&text, "\tmac = vec4(lessThan(A, B));\n"); break;
-		case _mac_sge: xgpu_text_append(&text, "\tmac = vec4(greaterThanEqual(A, B));\n"); break;
-		case _mac_arl: xgpu_text_append(&text, "\tmac = A;\n"); break;
-		default: xgpu_text_append(&text, "\tmac = vec4(0.0);\n"); break;
-		}
-		switch (ilu)
-		{
-		case _ilu_nop: break;
-		case _ilu_mov: xgpu_text_append(&text, "\tilu = C;\n"); break;
-		case _ilu_rcp: xgpu_text_append(&text, "\tilu = vec4(1.0 / C.x);\n"); break;
-		case _ilu_rcc: xgpu_text_append(&text, "\tilu = nv2a_rcc(C.x);\n"); break;
-		case _ilu_rsq: xgpu_text_append(&text, "\tilu = vec4(inversesqrt(abs(C.x)));\n"); break;
-		case _ilu_exp: xgpu_text_append(&text, "\tilu = nv2a_exp(C.x);\n"); break;
-		case _ilu_log: xgpu_text_append(&text, "\tilu = nv2a_log(C.x);\n"); break;
-		case _ilu_lit: xgpu_text_append(&text, "\tilu = nv2a_lit(C);\n"); break;
-		default: xgpu_text_append(&text, "\tilu = vec4(0.0);\n"); break;
-		}
-		/* the screen-space conversion takes the reciprocal of the clip-space
-		position's w (rcc of r12.w); keep the position it converts */
-		if (ilu == _ilu_rcc && field(instruction, 3, 28, 2) == _mux_temporary &&
-			((field(instruction, 2, 0, 2) << 2) | field(instruction, 3, 30, 2)) == 12)
-		{
-			xgpu_text_append(&text, "\tclip_position = oPos;\n\tclip_captured = true;\n");
-		}
-
-		/* results are written only after both units have read their inputs */
-		if (mac == _mac_arl)
-		{
-			xgpu_text_append(&text, "\ta0 = int(floor(mac.x + 0.001));\n");
-		}
-		else if (mac != _mac_nop && mac_mask)
-		{
-			write_mask(mac_mask, mask);
-			if (temporary == 12)
-				xgpu_text_append(&text, "\toPos.%s = mac.%s;\n", mask, mask);
-			else
-				xgpu_text_append(&text, "\tr%lu.%s = mac.%s;\n", temporary, mask, mask);
-		}
-		if (ilu != _ilu_nop && ilu_mask)
-		{
-			unsigned long ilu_temporary = mac != _mac_nop ? 1 : temporary;
-
-			write_mask(ilu_mask, mask);
-			if (ilu_temporary == 12)
-				xgpu_text_append(&text, "\toPos.%s = ilu.%s;\n", mask, mask);
-			else
-				xgpu_text_append(&text, "\tr%lu.%s = ilu.%s;\n", ilu_temporary, mask, mask);
-		}
-		if (output_mask && (output_from_ilu ? ilu : mac) != 0)
-		{
-			const char *source = output_from_ilu ? "ilu" : "mac";
-
-			write_mask(output_mask, mask);
-			if (output_is_register)
-				xgpu_text_append(&text, "\t%s.%s = %s.%s;\n", output_name(output_address), mask, source, mask);
-			/* writes to constant memory are not used by Halo's shaders */
-		}
-		if (field(instruction, 3, 0, 1))
-			break;
-	}
-
-	xgpu_text_append(&text,
-		"\t/* undo the screen-space conversion done with c[-38] and c[-37] */\n"
-		"\tvec3 scale = vec3(viewport_scale.x != 0.0 ? viewport_scale.x : 1.0,\n"
-		"\t\tviewport_scale.y != 0.0 ? viewport_scale.y : 1.0,\n"
-		"\t\tviewport_scale.z != 0.0 ? viewport_scale.z : 1.0);\n"
-		/* Direct3D 8 puts pixel centres on integer screen coordinates (the
-		game offsets its screen-space quads by -0.5 to match), OpenGL on
-		half-integers */
-		/* The conversion is screen = clip * c[-38] * rcc(w) + c[-37]; undoing
-		it by multiplying by w again is lossy near the camera plane, where
-		rcc clamps and 1/w rounds differently on each GPU (Mali put vertices
-		of the first-person weapon at the vanishing point, and desktop GPUs
-		threw the first-person arms' and weapon's vertices there in a pose
-		that brought them close to the camera: spikes from the screen's edge
-		to its center). Where the clip position was kept, the same result is
-		computed without dividing. */
-		"\tvec4 position;\n"
-		"\tif (clip_captured)\n"
-		"\t\tposition = vec4((clip_position.xyz * c[%d].xyz + (c[%d].xyz + vec3(0.5 + screen_offset, 0.5, 0.0)\n"
-		"\t\t\t- viewport_offset.xyz) * clip_position.w) / scale, clip_position.w);\n"
-		"\telse\n"
-		"\t{\n"
-		"\t\tvec3 ndc = (vec3(oPos.xy + vec2(0.5 + screen_offset, 0.5), oPos.z) - viewport_offset.xyz) / scale;\n"
-		"\t\tposition = vec4(ndc * oPos.w, oPos.w);\n"
-		"\t}\n"
-		/* A position whose w is zero, or is not a number, is the clip-space
-		origin: the screen conversion's reciprocal is clamped rather than
-		infinite, so a large position times a w of zero is exactly zero, and
-		the origin is inside the frustum. Nothing then clips the triangle
-		away and OpenGL divides zero by zero there: the vertex lands on the
-		middle of the screen and the triangle is drawn out to it from the
-		first-person weapon, whose pose follows the camera and so reaches the
-		camera plane. The divide on the Xbox sends such a vertex to infinity
-		and the clipper takes the triangle; put it behind the camera instead,
-		which the clipper also takes. */
-		"\tif (!(abs(position.w) > 0.0))\n"
-		"\t\tposition = vec4(0.0, 0.0, 0.0, -1.0);\n"
 		"\tgl_Position = position;\n"
 #ifdef HALO_GL_NO_CLIP_CONTROL
 		/* what glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE) does on desktop
@@ -588,7 +623,90 @@ char *nv2a_vertex_shader_to_glsl(const DWORD *instructions, unsigned long instru
 		"\txT2 = oT2;\n"
 		"\txT3 = oT3;\n"
 		"\txFog = oFog.x;\n"
-		"}\n",
-		XGPU_VERTEX_CONSTANT_BIAS - 38, XGPU_VERTEX_CONSTANT_BIAS - 37);
+		"}\n");
+	return text.buffer;
+}
+
+/* the prologue's functions, in HLSL; without branches, which a 9_3 vertex
+shader cannot take on a computed value */
+static const char hlsl_prologue[] =
+	XGPU_HLSL_PRELUDE
+	"cbuffer vertex_constants : register(b0)\n"
+	"{\n"
+	"\tfloat4 c[192];\n"
+	"\tfloat4 viewport_scale;\n"
+	"\tfloat4 viewport_offset;\n"
+	"\tfloat4 attributes[16];\n"
+	"\tfloat point_size;\n"
+	"\tfloat screen_offset;\n"
+	"\tfloat zero;\n"
+	"};\n"
+	"struct vertex_output\n"
+	"{\n"
+	XGPU_HLSL_VARYINGS
+	"};\n"
+	"float4 nv2a_rcc(float x)\n"
+	"{\n"
+	"	float r = 1.0 / x;\n"
+	"	r = r > 0.0 ? clamp(r, 5.42101e-20, 1.884467e+19) : clamp(r, -1.884467e+19, -5.42101e-20);\n"
+	"	return float4(r, r, r, r);\n"
+	"}\n"
+	"float4 nv2a_exp(float x)\n"
+	"{\n"
+	"	return float4(exp2(floor(x)), frac(x), exp2(x), 1.0);\n"
+	"}\n"
+	/* (the mantissa as exp2 of the logarithm's fraction, not x / exp2(e):
+	the compiler crashes folding that) */
+	"float4 nv2a_log(float x)\n"
+	"{\n"
+	"	float l = log2(max(abs(x), 1.0e-30));\n"
+	"	float e = floor(l);\n"
+	"	float4 r = float4(e, exp2(l - e), l, 1.0);\n"
+	"	return abs(x) == 0.0 ? float4(-1.0e30, 1.0, -1.0e30, 1.0) : r;\n"
+	"}\n"
+	"float4 nv2a_lit(float4 s)\n"
+	"{\n"
+	"	float specular = s.x > 0.0 ? pow(max(s.y, 0.0), clamp(s.w, -127.9961, 127.9961)) : 0.0;\n"
+	"	return float4(1.0, max(s.x, 0.0), specular, 1.0);\n"
+	"}\n";
+
+char *nv2a_vertex_shader_to_hlsl(const DWORD *instructions, unsigned long instruction_count,
+	unsigned long input_mask)
+{
+	struct xgpu_text text = { 0 };
+	unsigned long index;
+	BOOL first = TRUE;
+
+	xgpu_text_append(&text, "%s", hlsl_prologue);
+	xgpu_text_append(&text, "vertex_output main(");
+	for (index = 0; index < XGPU_VERTEX_ATTRIBUTE_COUNT; index++)
+	{
+		if (!(input_mask & (1UL << index)))
+			continue;
+		xgpu_text_append(&text, "%sfloat4 v%lu_in : TEXCOORD%lu", first ? "" : ", ", index, index);
+		first = FALSE;
+	}
+	xgpu_text_append(&text, ")\n{\n\tvertex_output output;\n");
+	for (index = 0; index < XGPU_VERTEX_ATTRIBUTE_COUNT; index++)
+	{
+		if (input_mask & (1UL << index))
+			xgpu_text_append(&text, "\tfloat4 v%lu = v%lu_in;\n", index, index);
+		else
+			xgpu_text_append(&text, "\tfloat4 v%lu = attributes[%lu];\n", index, index);
+	}
+	program_registers(&text, "float4", "zero");
+	program_instructions(&text, instructions, instruction_count, NULL);
+	program_position(&text, "float3", "float4");
+	xgpu_text_append(&text,
+		"\toutput.position = position;\n"
+		"\toutput.xT0 = oT0;\n"
+		"\toutput.xT1 = oT1;\n"
+		"\toutput.xT2 = oT2;\n"
+		"\toutput.xT3 = oT3;\n"
+		"\toutput.xD0 = clamp(oD0, 0.0, 1.0);\n"
+		"\toutput.xD1 = clamp(oD1, 0.0, 1.0);\n"
+		"\toutput.xFog = oFog.xxxx;\n"
+		"\treturn output;\n"
+		"}\n");
 	return text.buffer;
 }

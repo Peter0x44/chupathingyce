@@ -111,6 +111,68 @@ convert D3D's clip space themselves (nv2a_vsh.c) */
 char *nv2a_vertex_shader_to_glsl(const DWORD *instructions, unsigned long instruction_count,
 	unsigned long packed_attribute_mask, const struct nv2a_vertex_lighting *lighting);
 
+/* ---------- HLSL (the Direct3D 11 device, port/windows/src/d3d8_d3d11.c)
+
+The translators write the same statements for HLSL as for GLSL; this
+prelude gives HLSL GLSL's constructors and functions by their names, for
+shader model 4 at feature level 9_3 (Windows RT's GPUs): no integer bit
+operations, 32 pixel shader constants, 8 interpolated values. */
+#define XGPU_HLSL_PRELUDE \
+	"float4 vec4(float x) { return float4(x, x, x, x); }\n" \
+	"float4 vec4(float4 x) { return x; }\n" \
+	"float4 vec4(bool4 x) { return (float4)x; }\n" \
+	"float4 vec4(float a, float b, float c, float d) { return float4(a, b, c, d); }\n" \
+	"float4 vec4(float3 a, float b) { return float4(a, b); }\n" \
+	"float4 vec4(float2 a, float b, float c) { return float4(a, b, c); }\n" \
+	"float3 vec3(float x) { return float3(x, x, x); }\n" \
+	"float3 vec3(float3 x) { return x; }\n" \
+	"float3 vec3(float a, float b, float c) { return float3(a, b, c); }\n" \
+	"float3 vec3(float2 a, float b) { return float3(a, b); }\n" \
+	"float2 vec2(float x) { return float2(x, x); }\n" \
+	"float2 vec2(float a, float b) { return float2(a, b); }\n" \
+	/* (from the difference's sign: a bool4 cast to float4, or step, can fail \
+	the compiler's 9_3 code, "blob content mismatch") */ \
+	"float4 lessThan(float4 a, float4 b) { return saturate(sign(b - a)); }\n" \
+	"float4 greaterThanEqual(float4 a, float4 b) { return 1.0 - saturate(sign(b - a)); }\n" \
+	"float inversesqrt(float x) { return rsqrt(x); }\n" \
+	"float fract(float x) { return frac(x); }\n" \
+	"float mix(float a, float b, float t) { return lerp(a, b, t); }\n" \
+	"float3 mix(float3 a, float3 b, float t) { return lerp(a, b, t); }\n"
+
+/* what a vertex shader hands the pixel shader, in that order (the
+back-face colors, which no pixel shader reads, are left out: 9_3 has room for
+eight values and the position) */
+#define XGPU_HLSL_VARYINGS \
+	"\tfloat4 position : SV_Position;\n" \
+	"\tfloat4 xT0 : TEXCOORD0;\n" \
+	"\tfloat4 xT1 : TEXCOORD1;\n" \
+	"\tfloat4 xT2 : TEXCOORD2;\n" \
+	"\tfloat4 xT3 : TEXCOORD3;\n" \
+	"\tfloat4 xD0 : TEXCOORD4;\n" \
+	"\tfloat4 xD1 : TEXCOORD5;\n" \
+	"\tfloat4 xFog : TEXCOORD6;\n"
+
+/* the vertex shader's constant buffer, as the HLSL declares it */
+struct xgpu_hlsl_vertex_constants
+{
+	float c[XGPU_VERTEX_CONSTANT_COUNT][4];
+	float viewport_scale[4];
+	float viewport_offset[4];
+	/* the value of each input register the draw feeds no stream */
+	float attributes[XGPU_VERTEX_ATTRIBUTE_COUNT][4];
+	float point_size;
+	float screen_offset;
+	/* always 0 (nv2a_vsh.c program_registers) */
+	float zero;
+	float padding;
+};
+
+/* HLSL for an NV2A vertex program: the input registers in input_mask come
+from the vertex streams (each as four floats, at TEXCOORD<register>), the
+others from the constant buffer's attributes. Returns a malloc'd string. */
+char *nv2a_vertex_shader_to_hlsl(const DWORD *instructions, unsigned long instruction_count,
+	unsigned long input_mask);
+
 /* ---------- pixel shaders */
 
 enum
@@ -157,9 +219,35 @@ struct nv2a_pixel_shader_key
 	/* Discrete meter thresholds in texture 0's red are read at level zero,
 	without filtering. Coverage/brightness still use the filtered lookup. */
 	unsigned char point_threshold;
+	/* (HLSL) the channels each stage's texture is sampled from, which GL
+	textures swizzle themselves: 0 its own, 1 a Halo PC HUD meter's, 2 a Halo
+	PC multipurpose map's (xbox_textures.c upload) */
+	unsigned char channels[4];
+	unsigned char padding[1];
 };
 
 char *nv2a_pixel_shader_to_glsl(const struct nv2a_pixel_shader_key *key);
+
+/* the pixel shader's constant buffer, as the HLSL declares it */
+struct xgpu_hlsl_pixel_constants
+{
+	float ps_c0[8][4];
+	float ps_c1[8][4];
+	float ps_final_c0[4];
+	float ps_final_c1[4];
+	float fog_color[4];
+	float fog_parameters[4];
+	float bump_matrix[4][4];
+	float bump_luminance[4][4];
+	float texture_scale[4][4];
+	float alpha_reference;
+	float padding[3];
+};
+
+/* HLSL for a pixel shader (no per-pixel lighting, point thresholds or
+multisampled alpha test); its input is the vertex shader's
+(XGPU_HLSL_VARYINGS). Returns a malloc'd string. */
+char *nv2a_pixel_shader_to_hlsl(const struct nv2a_pixel_shader_key *key);
 
 #ifdef HALO_ANDROID
 /* ES samplers have no LOD bias of their own */

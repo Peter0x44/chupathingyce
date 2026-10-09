@@ -1,5 +1,5 @@
 """Ninja rules for the native Windows builds (``ninja windows``, ``ninja
-windows64``, ``ninja windows-arm64``).
+windows64``, ``ninja windows-arm64``, ``ninja windows-d3d11``).
 
 Like the Linux build (tools/linux_build.py), it compiles the game sources
 with clang for 32-bit x86 Windows (i686-pc-windows-msvc), adds the platform layer shared with
@@ -16,6 +16,9 @@ Edition maps (HALO_CUSTOM_EDITION).
 (aarch64-pc-windows-msvc) into ``build/windows-arm64/halo.exe``; it
 cross-compiles from an x64 machine as well, with Visual Studio's ARM64
 libraries.
+``ninja windows-d3d11`` is the 32-bit build drawn with Direct3D 11 at
+feature level 9_3 rather than OpenGL (``build/windows-d3d11/halo.exe``): the
+renderer of the Windows RT build, on a computer that runs the rest.
 Windows keeps `long` 32 bits wide on x64 and ARM64 (LLP64), as the Xbox's compiler
 did, so the sources need none of the LP64 builds' `long` rewrite
 (tools/lp64_build.py).
@@ -188,6 +191,9 @@ class WindowsTarget:
     pgo: bool = True
     # leaves out what the 64-bit builds do (port/linux/port.json "lp64")
     lp64_exclusions: bool = False
+    # what draws: "gl" (port/linux/src/d3d8_gl.c), or "d3d11", Direct3D 11
+    # at feature level 9_3 (HALO_D3D11: port/windows/src/d3d8_d3d11.c)
+    renderer: str = "gl"
 
     @property
     def build(self) -> Path:
@@ -298,6 +304,31 @@ WINDOWS_ARM64 = WindowsTarget(
     pgo=False,
     lp64_exclusions=True,
 )
+
+
+# The 32-bit build drawn with Direct3D 11 at feature level 9_3, as the
+# Windows RT build is (port/windows/include/halo_d3d11.h): that renderer,
+# on a computer that also runs the 32-bit game (feature level 9_3 asked of
+# its GPU, or of Direct3D's software renderer).
+WINDOWS_D3D11 = WindowsTarget(
+    name="windows-d3d11",
+    triple=WINDOWS32.triple,
+    sdl_arch=WINDOWS32.sdl_arch,
+    abi_flags=[*WINDOWS32.abi_flags, "-DHALO_D3D11"],
+    game_flags=WINDOWS32.game_flags,
+    platform_flags=WINDOWS32.platform_flags,
+    win32_flags=WINDOWS32.win32_flags,
+    ldflags=WINDOWS32.ldflags,
+    comment="Native Windows build drawn with Direct3D 11 at feature level 9_3 (ninja windows-d3d11)",
+    pgo=False,
+    renderer="d3d11",
+)
+
+# the platform layer's GL renderer, which the Direct3D 11 builds draw without
+# (their overlay is d3d8_d3d11.c's for now)
+GL_RENDERER_SOURCES = {"d3d8_gl.c", "gl_functions.c", "xgpu_post.c", "xgpu_shader_cache.c", "ui_overlay.c"}
+# and what Direct3D 11 needs (d3dcompiler_47.dll is loaded when the device is made)
+D3D11_LIBRARIES = ["d3d11", "dxgi", "dxguid"]
 
 
 def _load_config() -> Dict[str, Any]:
@@ -443,13 +474,13 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
     except OSError as error:
         print(f"Windows build disabled: cannot fetch SDL3 ({error})", file=sys.stderr)
         return
-    for target in (WINDOWS32, WINDOWS64, WINDOWS_ARM64):
+    for target in (WINDOWS32, WINDOWS64, WINDOWS_ARM64, WINDOWS_D3D11):
         generate_windows_target(n, sln, target)
 
 
 def generate_windows_target(n: Writer, sln: Any, target: WindowsTarget) -> None:
-    """one Windows build's rules: ``ninja windows``, ``ninja windows64`` or
-    ``ninja windows-arm64``"""
+    """one Windows build's rules: ``ninja windows``, ``ninja windows64``,
+    ``ninja windows-arm64`` or ``ninja windows-d3d11``"""
     linux_config: Dict[str, Any] = json.loads((LINUX_DIR / "port.json").read_text(encoding="utf-8"))
     config = _load_config()
 
@@ -516,6 +547,7 @@ def generate_windows_target(n: Writer, sln: Any, target: WindowsTarget) -> None:
     libs = " ".join(
         [_quote(sdl_lib / "SDL3.lib")]
         + [f"-l{lib}" for lib in config.get("libraries", [])]
+        + ([f"-l{lib}" for lib in D3D11_LIBRARIES] if target.renderer == "d3d11" else [])
     )
     # (the linker's map beside the program, halo.map: its functions'
     # addresses, kept with the symbols, tools/ci_build.py)
@@ -607,6 +639,8 @@ def generate_windows_target(n: Writer, sln: Any, target: WindowsTarget) -> None:
             f"-I{_quote(sdl_include)}",
         ])
         replaced = set(config.get("replaced_platform_sources", []))
+        if target.renderer == "d3d11":
+            replaced |= GL_RENDERER_SOURCES
         for source in sorted(linux_platform.glob("*.c")):
             if source.name in replaced:
                 continue

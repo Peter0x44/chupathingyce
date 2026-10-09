@@ -18,6 +18,9 @@ and the debug keyboard that the game's console reads.
 #include "touch_input.h"
 #include "delta.h"
 #include "crash_report.h"
+#ifdef HALO_D3D11
+#include "halo_d3d11.h"
+#endif
 
 #include <SDL3/SDL.h>
 #include <stdio.h>
@@ -908,6 +911,32 @@ BOOL platform_video_initialize(unsigned long width, unsigned long height)
 	if (!platform_sdl_initialize())
 		return FALSE;
 
+#ifdef HALO_D3D11
+	/* a window without OpenGL, and the Direct3D 11 device and swap chain
+	for it (port/windows/src/win32_d3d11.c) */
+	(void)version;
+	(void)width;
+	(void)height;
+	snprintf(title, sizeof(title), "ChupathingyCE %s", updater_version());
+	platform_window_size_setting(&platform_window_width, &platform_window_height);
+	platform_window = SDL_CreateWindow(title, (int)platform_window_width, (int)platform_window_height,
+		SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+		(config_boolean("debug.hidden_window") ? SDL_WINDOW_HIDDEN : 0) |
+		(platform_fullscreen_setting() ? SDL_WINDOW_FULLSCREEN : 0));
+	if (!platform_window)
+	{
+		platform_log("SDL_CreateWindow failed: %s", SDL_GetError());
+		return FALSE;
+	}
+	platform_fullscreen_requested = platform_fullscreen_setting();
+	platform_fullscreen_kind_apply();
+	if (!win32_d3d11_initialize(platform_window, config_string("display.d3d11_feature_level"),
+		config_boolean("display.d3d11_warp")))
+		return FALSE;
+	platform_event_thread = SDL_GetCurrentThreadID();
+	platform_mouse_capture(TRUE);
+	return TRUE;
+#else
 #ifdef HALO_ANDROID
 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -1022,6 +1051,7 @@ BOOL platform_video_initialize(unsigned long width, unsigned long height)
 	platform_mouse_capture(TRUE);
 #endif
 	return TRUE;
+#endif
 }
 
 /* display.mode, display.resolution (fullscreen's display mode),
@@ -1058,6 +1088,8 @@ void platform_display_apply(void)
 
 		macos_set_swap_interval(config_boolean("display.vsync") ? 1 : 0);
 	}
+#elif defined(HALO_D3D11)
+	/* (each present asks for display.vsync: d3d8_d3d11.c) */
 #else
 	SDL_GL_SetSwapInterval(config_boolean("display.vsync") ? 1 : 0);
 #endif
@@ -1107,7 +1139,11 @@ void platform_video_swap(void)
 	Uint64 interval, now;
 
 #endif
+#ifndef HALO_D3D11
+	/* (Direct3D 11's device presents itself: d3d8_d3d11.c; this is then
+	the frame rate limit only) */
 	SDL_GL_SwapWindow(platform_window);
+#endif
 #ifndef HALO_ANDROID
 	interval = frame_interval_ns();
 	if (!interval)

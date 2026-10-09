@@ -55,6 +55,8 @@ enum
 	_platform_all = _platform_desktop | _platform_android,
 	/* (of the desktop builds, only Windows) */
 	_platform_windows = 4,
+	/* (of the Windows builds, only Direct3D 11's: HALO_D3D11) */
+	_platform_d3d11 = 8,
 };
 
 struct config_setting
@@ -118,6 +120,12 @@ static const struct config_setting config_settings[] =
 	{ "display.max_fps", _config_integer, "0", "HALO_MAX_FPS", _environment_value, _platform_desktop,
 		"With vsync off, the most frames a second: 0 for twice the display's\n"
 		"refresh rate, -1 for no limit (which can hang some Intel graphics)." },
+	{ "display.d3d11_feature_level", _config_string, "\"9_3\"", "HALO_D3D11_FEATURE_LEVEL", _environment_value,
+		_platform_d3d11,
+		"The Direct3D 11 feature level the game draws at: \"9_3\", Windows RT's\n"
+		"(Surface 2, Surface RT's \"9_1\"), or \"best\", the GPU's own." },
+	{ "display.d3d11_warp", _config_boolean, "false", "HALO_D3D11_WARP", _environment_set_is_true, _platform_d3d11,
+		"Draw with Direct3D's software renderer (WARP) rather than the GPU." },
 	{ "display.anti_aliasing", _config_string, "\"off\"", "HALO_ANTI_ALIASING", _environment_value, _platform_all,
 		"Smoothing of jagged edges, which the Xbox did not have: \"off\"; \"fxaa\"\n"
 		"or \"smaa\" smooth the 3D view once it is drawn (the HUD and menus stay\n"
@@ -591,6 +599,8 @@ static const struct config_setting config_settings[] =
 
 #ifdef HALO_ANDROID
 #define CONFIG_PLATFORM _platform_android
+#elif defined(_WIN32) && defined(HALO_D3D11)
+#define CONFIG_PLATFORM (_platform_desktop | _platform_windows | _platform_d3d11)
 #elif defined(_WIN32)
 #define CONFIG_PLATFORM (_platform_desktop | _platform_windows)
 #else
